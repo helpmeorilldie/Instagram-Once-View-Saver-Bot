@@ -2,12 +2,8 @@
 """
 IG .eww snap saver — single-file build.
 
-Gate: the bot only serves users who follow it. Nothing is followed back.
-DM requests from followers are accepted automatically.
-
 Env vars:
   IG_SESSIONID      (required) value of the `sessionid` cookie
-  IG_USER_ID        (optional) own uid, used as a fallback when the login probe 403s
   TRIGGER           (default ".eww")
   POLL_INTERVAL     seconds between inbox polls (default 1.5)
   ONLY_THREADS      comma separated thread ids to restrict to
@@ -20,8 +16,6 @@ Env vars:
   FOLLOW_CACHE_TTL  seconds a follow verdict is trusted (default 20)
   FOLLOW_FAST       seconds between new-follower checks (default 6)
   FOLLOW_FULL       seconds between full follower reconciles (default 240)
-  REQUEST_AUTO      "1" to auto-accept requests from followers (default 1)
-  REQUEST_POLL      seconds between request inbox checks (default 20)
   WORKERS           trigger worker threads (default 3)
 
   ADMINS            comma separated usernames with .admin access
@@ -39,7 +33,6 @@ import sys
 import threading
 import time
 import traceback
-from pathlib import Path
 from dotenv import load_dotenv
 from datetime import datetime
 from pathlib import Path
@@ -52,60 +45,39 @@ from instagrapi.exceptions import (
     DirectMessageRequestsDisabled,
     LoginRequired,
 )
-
+load_dotenv()
 # --------------------------------------------------------------------------- #
 # config
 # --------------------------------------------------------------------------- #
-
-
-load_dotenv()
-
 SESSIONID = os.getenv("IG_SESSIONID", "").strip()
-USER_ID_HINT = os.getenv("IG_USER_ID", "").strip()
-
 TRIGGER = os.getenv("TRIGGER", ".eww").strip().lower()
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "1.5"))
-
-PROCESS_BACKLOG = os.getenv("PROCESS_BACKLOG", "0") == "1"
-DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
-
+PROCESS_BACKLOG = os.getenv("PROCESS_BACKLOG") == "1"
+DRY_RUN = os.getenv("DRY_RUN") == "1"
 MAX_BYTES = int(float(os.getenv("MAX_MB", "60")) * 1024 * 1024)
-
 ONLY_THREADS = {
     t.strip()
     for t in os.getenv("ONLY_THREADS", "").split(",")
     if t.strip()
 }
-
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 
 DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "10"))
 FOLLOW_CACHE_TTL = float(os.getenv("FOLLOW_CACHE_TTL", "20"))
 FOLLOW_FAST = float(os.getenv("FOLLOW_FAST", "6"))
 FOLLOW_FULL = float(os.getenv("FOLLOW_FULL", "240"))
-
-REQUEST_AUTO = os.getenv("REQUEST_AUTO", "1") == "1"
-REQUEST_POLL = float(os.getenv("REQUEST_POLL", "20"))
-
 WORKERS = int(os.getenv("WORKERS", "3"))
 
 ADMINS_ENV = [
     a.strip().lstrip("@").lower()
-    for a in os.getenv(
-        "ADMINS",
-        "ammar._.azam,noxmirage_"
-    ).split(",")
+    for a in os.getenv("ADMINS", "ammar._.azam,noxmirage_").split(",")
     if a.strip()
 ]
 
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
-TG_MEDIA_CHAT_ID = (
-    os.getenv("TG_MEDIA_CHAT_ID", "").strip() or TG_CHAT_ID
-)
-
+TG_MEDIA_CHAT_ID = os.getenv("TG_MEDIA_CHAT_ID", "").strip() or TG_CHAT_ID
 TG_ENABLED = bool(TG_BOT_TOKEN and TG_CHAT_ID)
-
 BACKUP_INTERVAL = float(os.getenv("BACKUP_INTERVAL", "900"))
 
 MEDIA_DIR = DATA_DIR / "media"
@@ -369,17 +341,6 @@ def is_admin(uid):
     return int(uid) in admin_ids()
 
 
-def thread_rows():
-    """Sorted (tid, info) rows for admin views, busiest first."""
-    rows = []
-    for tid, info in STATE.get("threads", {}).items():
-        stats = STATE["stats"].get(tid, {})
-        msgs = sum(int(v.get("msgs", 0)) for v in stats.values())
-        rows.append((tid, info, msgs, len(stats)))
-    rows.sort(key=lambda r: r[2], reverse=True)
-    return rows
-
-
 # --------------------------------------------------------------------------- #
 # telegram
 # --------------------------------------------------------------------------- #
@@ -425,13 +386,11 @@ def tg_backup_db():
                 "admins": STATE.get("admins", []),
                 "welcome": STATE.get("welcome", {}),
                 "threads": STATE.get("threads", {}),
-                "stats": STATE.get("stats", {}),
             }
         snap.write_text(json.dumps(payload, indent=1))
         with open(snap, "rb") as fh:
             tg("sendDocument", files={"document": ("db_backup.json", fh)},
                caption=f"db backup | users {len(payload['users'])} | "
-                       f"threads {len(payload['threads'])} | "
                        f"followers {len(payload['known_followers'])} | "
                        f"archived {payload['archive_total']}")
     except Exception as e:
@@ -439,64 +398,32 @@ def tg_backup_db():
 
 
 # --------------------------------------------------------------------------- #
-# client / login
+# client
 # --------------------------------------------------------------------------- #
-def _new_client():
+def build_client():
     cl = Client()
     cl.delay_range = [0.4, 1.0]
-    return cl
-
-
-def build_client():
-    """Cached settings first, then sessionid with retries and a uid fallback."""
     if SETTINGS_FILE.exists():
         try:
-            cl = _new_client()
             cl.load_settings(SETTINGS_FILE)
             cl.login_by_sessionid(SESSIONID)
+            cl.get_timeline_feed()
             log("logged in with cached device settings")
             return cl
         except Exception as e:
-            log("cached settings login failed:", e)
+            log("cached settings failed (%s), re-logging" % e)
 
-    last = None
-    for attempt in range(1, 4):
-        try:
-            cl = _new_client()
-            cl.login_by_sessionid(SESSIONID)
-            DATA_DIR.mkdir(parents=True, exist_ok=True)
-            cl.dump_settings(SETTINGS_FILE)
-            log("logged in as", cl.username, "(uid %s)" % cl.user_id)
-            return cl
-        except Exception as e:
-            last = e
-            log("login attempt", attempt, "failed:", e)
-
-            # the info probe 403s transiently; the cookie itself is often still fine
-            hint = USER_ID_HINT or (SESSIONID.split("%3A")[0] if "%3A" in SESSIONID else "")
-            if hint.isdigit():
-                try:
-                    cl = _new_client()
-                    cl.login_by_sessionid(SESSIONID)
-                except Exception:
-                    pass
-                try:
-                    cl.user_id = hint
-                    cl.get_timeline_feed()
-                    DATA_DIR.mkdir(parents=True, exist_ok=True)
-                    cl.dump_settings(SETTINGS_FILE)
-                    log("login probe failed, continuing with uid", hint)
-                    return cl
-                except Exception as e2:
-                    log("uid fallback failed:", e2)
-
-            time.sleep(5 * attempt)
-
-    raise last if last else RuntimeError("login failed")
+    cl = Client()
+    cl.delay_range = [0.4, 1.0]
+    cl.login_by_sessionid(SESSIONID)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    cl.dump_settings(SETTINGS_FILE)
+    log("logged in as", cl.username, "(uid %s)" % cl.user_id)
+    return cl
 
 
 # --------------------------------------------------------------------------- #
-# follow gate — check only
+# follow gate
 # --------------------------------------------------------------------------- #
 _follow_cache = {}
 _follow_lock = threading.Lock()
@@ -510,13 +437,15 @@ def _friendship(cl, uid):
         try:
             fs = fn(uid)
             if hasattr(fs, "followed_by"):
-                return bool(fs.followed_by)
+                return {"followed_by": bool(fs.followed_by),
+                        "following": bool(getattr(fs, "following", False))}
         except Exception as e:
             log("friendship via", name, "failed:", e)
     try:
         raw = cl.private_request(f"friendships/show/{uid}/")
         if isinstance(raw, dict):
-            return bool(raw.get("followed_by"))
+            return {"followed_by": bool(raw.get("followed_by")),
+                    "following": bool(raw.get("following"))}
     except Exception as e:
         log("friendship via private_request failed:", e)
     return None
@@ -530,8 +459,10 @@ def is_follower(cl, uid, force=False):
         if hit and not force and now - hit[1] < FOLLOW_CACHE_TTL:
             return hit[0]
 
-    verdict = _friendship(cl, uid)
-    if verdict is None:
+    fs = _friendship(cl, uid)
+    if fs is not None:
+        verdict = fs["followed_by"]
+    else:
         with LOCK:
             known = {int(x) for x in STATE.get("known_followers", [])}
         verdict = uid in known if known else (hit[0] if hit else True)
@@ -542,6 +473,7 @@ def is_follower(cl, uid, force=False):
 
 
 def fetch_followers(cl, amount):
+    """Newest-first follower ids. amount=0 pulls everything."""
     for name in ("user_followers_v1", "user_followers"):
         fn = getattr(cl, name, None)
         if fn is None:
@@ -554,8 +486,41 @@ def fetch_followers(cl, amount):
     return None
 
 
-def follower_watch(cl):
+def follow_back_one(cl, uid):
+    try:
+        cl.user_follow(uid)
+    except Exception as e:
+        log("follow back failed for", uid, e)
+        return False
+
+    handle = str(uid)
+    try:
+        info = cl.user_info(uid)
+        handle = f"@{info.username}"
+        touch_user(uid, info.username, info.full_name)
+    except Exception:
+        pass
+
+    with _follow_lock:
+        _follow_cache[uid] = (True, time.time())
+    log("followed back", handle)
+    tg_note(f"new follower, followed back: {handle}")
+    return True
+
+
+def follow_back_loop(cl):
+    """Tight newest-follower watch + slow full reconcile."""
     known = {int(x) for x in STATE.get("known_followers", [])}
+
+    if not known:
+        base = fetch_followers(cl, 0)
+        if base:
+            known = base
+            with LOCK:
+                STATE["known_followers"] = sorted(known)
+            save_state()
+            log("follower baseline:", len(known))
+
     last_full = time.time()
 
     while not _stop.is_set():
@@ -568,80 +533,21 @@ def follower_watch(cl):
             fresh = live - known
             if fresh:
                 log("new follower(s):", len(fresh))
-                tg_note(f"new follower(s): {len(fresh)}")
                 for uid in fresh:
-                    with _follow_lock:
-                        _follow_cache[uid] = (True, time.time())
-            if fresh or full:
-                known = live if full else (known | fresh)
+                    follow_back_one(cl, uid)
+                    time.sleep(0.6)
+                known |= fresh
+                with LOCK:
+                    STATE["known_followers"] = sorted(known)
+                save_state()
+            elif full:
+                known = live
                 with LOCK:
                     STATE["known_followers"] = sorted(known)
                 save_state()
 
         _follow_wake.wait(FOLLOW_FAST)
         _follow_wake.clear()
-
-
-# --------------------------------------------------------------------------- #
-# message requests — auto accept from followers
-# --------------------------------------------------------------------------- #
-def approve_request(cl, thread_id):
-    tid = str(thread_id)
-    fn = getattr(cl, "direct_requests_approve", None)
-    if fn is not None:
-        try:
-            try:
-                fn([tid])
-            except TypeError:
-                fn(tid)
-            return True
-        except Exception as e:
-            log("approve via method failed:", e)
-    try:
-        cl.private_request("direct_v2/threads/approve/",
-                           data={"thread_ids": json.dumps([tid])})
-        return True
-    except Exception as e:
-        log("approve via endpoint failed:", e)
-    return False
-
-
-def request_watch(cl):
-    done = set()
-    while not _stop.is_set():
-        try:
-            pending = cl.direct_pending_inbox(amount=20) or []
-        except LoginRequired:
-            _stop.wait(REQUEST_POLL)
-            continue
-        except Exception as e:
-            log("pending inbox failed:", e)
-            pending = []
-
-        for t in pending:
-            tid = str(t.id)
-            if tid in done:
-                continue
-            try:
-                if getattr(t, "is_group", False):
-                    members = [int(u.pk) for u in (t.users or [])
-                               if int(u.pk) != int(cl.user_id)]
-                    ok = any(is_follower(cl, m) for m in members)
-                    who = "group"
-                else:
-                    who = str(int(t.id))
-                    ok = is_follower(cl, int(t.id))
-                if not ok:
-                    continue
-                if approve_request(cl, tid):
-                    done.add(tid)
-                    log("accepted request from", who)
-                    tg_note(f"accepted dm request from {who}")
-            except Exception as e:
-                log("request handling failed:", e)
-            time.sleep(1)
-
-        _stop.wait(REQUEST_POLL)
 
 
 # --------------------------------------------------------------------------- #
@@ -690,6 +596,7 @@ def dashboard(cl, thread, msg, uid):
     rec = STATE["users"].get(str(uid), {})
     used = usage_today(uid)
     base = base_limit(uid)
+    cred = credits(uid)
     following = is_follower(cl, uid)
 
     lines = []
@@ -702,7 +609,7 @@ def dashboard(cl, thread, msg, uid):
         "◌ " + styled("name") + " ⇝ " + (rec.get("name") or getattr(u, "full_name", None) or "-"),
         "◌ " + styled("saved today") + f" ⇝ {used}/{base}",
         "◌ " + styled("free left") + f" ⇝ {max(0, base - used)}",
-        "◌ " + styled("credits") + f" ⇝ {credits(uid)}",
+        "◌ " + styled("credits") + f" ⇝ {cred}",
         "◌ " + styled("archived") + f" ⇝ {rec.get('archived', 0)}",
         "◌ " + styled("following bot") + " ⇝ " + ("✅" if following else "❌"),
         "◌ " + styled("reset") + " ⇝ 00:00 IST",
@@ -779,7 +686,6 @@ def about_card(cl, thread, msg, arg):
 
     send_text(cl, thread, msg, "\n".join([
         "🔎 " + styled("gc user info"),
-        "◌ " + styled("gc") + f" ⇝ {getattr(thread, 'thread_title', None) or thread.id}",
         "◌ " + styled("username") + f" ⇝ @{username}",
         "◌ " + styled("name") + f" ⇝ {name}",
         "◌ " + styled("uid") + f" ⇝ {uid}",
@@ -791,7 +697,7 @@ def about_card(cl, thread, msg, arg):
         "◌ " + styled("last online") + f" ⇝ {last_online}",
         "◌ " + styled("follows bot") + " ⇝ " + ("✅" if following else "❌"),
         "◌ " + styled("credits") + f" ⇝ {credits(uid)}",
-        "◌ " + styled("archived all gc") + f" ⇝ {rec.get('archived', 0)}",
+        "◌ " + styled("archived") + f" ⇝ {rec.get('archived', 0)}",
         "",
         styled("counts are from the moment tracking started"),
         "", CREDIT,
@@ -805,7 +711,7 @@ def bot_card(cl, thread, msg):
         styled("saves view once photos and videos from instagram group chats and dms before they expire"),
         styled("reply") + f" {TRIGGER} " + styled("to any view once snap and it lands in your dm"),
         "",
-        "◌ " + styled("works for") + " ⇝ " + styled("followers only"),
+        "◌ " + styled("works for") + " ⇝ " + styled("followers only, follows back automatically"),
         "◌ " + styled("free saves") + f" ⇝ {DAILY_LIMIT} " + styled("per day"),
         "◌ " + styled("reset") + " ⇝ 00:00 IST",
         "◌ " + styled("extra saves") + " ⇝ " + styled("credits from admins"),
@@ -841,8 +747,6 @@ def admin_panel(cl, thread, msg):
         "◌ " + styled("commands"),
         f"{ADMIN_CMD} " + styled("stats") + " ⇝ " + styled("usage summary"),
         f"{ADMIN_CMD} " + styled("users") + " ⇝ " + styled("top savers"),
-        f"{ADMIN_CMD} " + styled("threads") + " ⇝ " + styled("chat list"),
-        f"{ADMIN_CMD} " + styled("gc") + " N ⇝ " + styled("chat detail"),
         f"{ADMIN_CMD} " + styled("find") + " @" + styled("user") + " ⇝ " + styled("lookup"),
         f"{ADMIN_CMD} " + styled("limit") + " @" + styled("user") + " N ⇝ " + styled("cap"),
         f"{ADMIN_CMD} " + styled("addcredit") + " @" + styled("user") + " N ⇝ " + styled("grant saves"),
@@ -891,47 +795,6 @@ def admin_cmd(cl, thread, msg, body):
         lines = ["🏆 " + styled("top savers")]
         lines += [f"{i}. @{r.get('username', u)} ⇝ {r.get('archived', 0)}"
                   for i, (u, r) in enumerate(ranked, 1)] or [styled("nobody yet")]
-        return send_text(cl, thread, msg, "\n".join(lines + ["", CREDIT]), reply=True)
-
-    if sub == "threads":
-        rows = thread_rows()[:10]
-        lines = ["🗂️ " + styled("tracked chats")]
-        for i, (tid, info, msgs, members) in enumerate(rows, 1):
-            kind = "gc" if info.get("group") else "dm"
-            lines.append(f"{i}. [{kind}] {info.get('name', tid)[:28]} ⇝ "
-                         f"{msgs} " + styled("msgs") + f", {members} " + styled("users"))
-        if not rows:
-            lines.append(styled("nothing tracked yet"))
-        lines += ["", styled("use") + f" {ADMIN_CMD} " + styled("gc") + " N " + styled("for detail"),
-                  "", CREDIT]
-        return send_text(cl, thread, msg, "\n".join(lines), reply=True)
-
-    if sub == "gc":
-        rows = thread_rows()
-        if not rest or not rest[0].isdigit() or not (1 <= int(rest[0]) <= len(rows)):
-            return send_text(cl, thread, msg,
-                             styled("give a number from") + f" {ADMIN_CMD} " + styled("threads"),
-                             reply=True)
-        tid, info, msgs, members = rows[int(rest[0]) - 1]
-        stats = STATE["stats"].get(tid, {})
-        top = sorted(stats.items(), key=lambda kv: int(kv[1].get("msgs", 0)), reverse=True)[:8]
-        lines = [
-            "🗂️ " + styled("chat detail"),
-            "◌ " + styled("name") + f" ⇝ {info.get('name', tid)}",
-            "◌ " + styled("thread id") + f" ⇝ {tid}",
-            "◌ " + styled("type") + " ⇝ " + styled("group" if info.get("group") else "dm"),
-            "◌ " + styled("messages") + f" ⇝ {msgs}",
-            "◌ " + styled("users") + f" ⇝ {members}",
-            "◌ " + styled("welcome set") + " ⇝ " + ("✅" if str(tid) in STATE.get("welcome", {}) else "❌"),
-            "",
-            "◌ " + styled("top posters"),
-        ]
-        for u, s in top:
-            uname = (STATE["users"].get(u) or {}).get("username", u)
-            lines.append(f"‣ @{uname} ⇝ {s.get('msgs', 0)} " + styled("msgs") +
-                         f", {s.get('deleted', 0)} " + styled("deleted"))
-        if not top:
-            lines.append(styled("no traffic yet"))
         return send_text(cl, thread, msg, "\n".join(lines + ["", CREDIT]), reply=True)
 
     if sub in ("find", "limit", "reset", "ban", "unban", "addadmin", "deladmin",
@@ -1065,8 +928,10 @@ def handle_trigger(cl, thread, msg, cache):
         send_text(cl, thread, msg, styled("you are banned from using this bot"), reply=True)
         return
 
+    # force a fresh verdict so a just-followed user is never turned away
     if not is_follower(cl, uid, force=True):
         log("  not a follower")
+        _follow_wake.set()
         send_text(cl, thread, msg, follow_prompt(msg), reply=True)
         return
 
@@ -1322,6 +1187,7 @@ def realtime_thread(cl):
 
     try:
         cl.realtime_on("on_new_follower", lambda payload: _follow_wake.set())
+        log("realtime follower hook on")
     except Exception:
         pass
 
@@ -1355,20 +1221,7 @@ def main():
         sys.exit("IG_SESSIONID is not set")
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-    cl = None
-    while not _stop.is_set():
-        try:
-            cl = build_client()
-            break
-        except Exception as e:
-            log("login failed:", e)
-            log("sessionid is most likely dead — paste a fresh IG_SESSIONID")
-            if _stop.wait(45):
-                return
-    if cl is None:
-        return
-
+    cl = build_client()
     BOT_USERNAME = cl.username
     log("bot account:", BOT_USERNAME, "| base limit", DAILY_LIMIT, "/day IST")
 
@@ -1396,9 +1249,7 @@ def main():
         log(traceback.format_exc())
     save_state()
 
-    threading.Thread(target=follower_watch, args=(cl,), daemon=True).start()
-    if REQUEST_AUTO:
-        threading.Thread(target=request_watch, args=(cl,), daemon=True).start()
+    threading.Thread(target=follow_back_loop, args=(cl,), daemon=True).start()
     if TG_ENABLED:
         threading.Thread(target=backup_loop, daemon=True).start()
     if os.environ.get("REALTIME", "1") == "1":
