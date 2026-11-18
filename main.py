@@ -30,7 +30,12 @@ def boot():
         print("db restored from telegram")
 
     db.init()
-
+    if C.TG_TOKEN and C.TG_STORAGE_CHANNEL:
+        try:
+            tg.call("getChat", chat_id=C.TG_STORAGE_CHANNEL)
+            print("storage channel ok")
+        except Exception as e:
+            print("STORAGE CHANNEL BAD:", e)
     cl = igbot.build_client()
     cl.user_id = cl.user_id
     resolve_admins(cl)
