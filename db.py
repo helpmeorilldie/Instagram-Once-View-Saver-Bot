@@ -8,6 +8,8 @@ LOCK = threading.RLock()
 CONN: sqlite3.Connection | None = None
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS seen(
+  thread_id TEXT, msg_id TEXT, PRIMARY KEY(thread_id, msg_id));
 CREATE TABLE IF NOT EXISTS users(
   uid INTEGER PRIMARY KEY, username TEXT, full_name TEXT,
   first_seen INTEGER, last_seen INTEGER, msgs INTEGER DEFAULT 0,
@@ -24,7 +26,13 @@ CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 """
 
+def mark_seen(thread_id, msg_id):
+    q("INSERT OR IGNORE INTO seen VALUES(?,?)", (str(thread_id), str(msg_id)))
 
+
+def was_seen(thread_id, msg_id):
+    return one("SELECT 1 FROM seen WHERE thread_id=? AND msg_id=?",
+               (str(thread_id), str(msg_id))) is not None
 def init():
     global CONN
     C.DATA_DIR.mkdir(parents=True, exist_ok=True)
