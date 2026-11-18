@@ -473,16 +473,61 @@ def is_follower(cl, uid, force=False):
 
 
 def fetch_followers(cl, amount):
-    """Newest-first follower ids. amount=0 pulls everything."""
+    """Safely fetch follower IDs from supported response formats."""
+
     for name in ("user_followers_v1", "user_followers"):
         fn = getattr(cl, name, None)
-        if fn is None:
+
+        if not callable(fn):
             continue
+
         try:
             data = fn(cl.user_id, amount=amount)
-            return {int(k) for k in data.keys()}
+
+            if data is None:
+                log("Follower API returned empty response:", name)
+                continue
+
+            # Handle dictionary responses
+            if isinstance(data, dict):
+                users = data.values()
+
+            # Handle list responses
+            elif isinstance(data, (list, tuple, set)):
+                users = data
+
+            else:
+                log("Unexpected follower response:", type(data).__name__)
+                continue
+
+            follower_ids = set()
+
+            for user in users:
+                try:
+                    if isinstance(user, dict):
+                        uid = user.get("pk") or user.get("id")
+                    else:
+                        uid = getattr(user, "pk", None)
+                        uid = uid or getattr(user, "id", None)
+
+                    if uid is not None:
+                        follower_ids.add(int(uid))
+
+                except (TypeError, ValueError):
+                    continue
+
+            return follower_ids
+
         except Exception as e:
-            log("follower fetch via", name, "failed:", e)
+            error = str(e)
+
+            if "429" in error or "too many requests" in error.lower():
+                log("Instagram rate limit detected. Pausing follower checks.")
+                time.sleep(300)
+                return None
+
+            log("Follower fetch failed:", name, error)
+
     return None
 
 
