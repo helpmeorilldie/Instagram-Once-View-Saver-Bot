@@ -2,6 +2,8 @@
 """
 IG .eww snap saver — single-file build.
 
+Gate: the bot only serves users who follow it. Nothing is followed back.
+
 Env vars:
   IG_SESSIONID      (required) value of the `sessionid` cookie
   TRIGGER           (default ".eww")
@@ -33,12 +35,11 @@ import sys
 import threading
 import time
 import traceback
+from dotenv import load_dotenv
+from pathlib import Path
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from pathlib import Path
-from dotenv import load_dotenv
-
 
 import requests
 from instagrapi import Client
@@ -47,10 +48,13 @@ from instagrapi.exceptions import (
     DirectMessageRequestsDisabled,
     LoginRequired,
 )
-load_dotenv()
+
 # --------------------------------------------------------------------------- #
 # config
 # --------------------------------------------------------------------------- #
+
+load_dotenv()
+
 SESSIONID = os.getenv("IG_SESSIONID", "").strip()
 TRIGGER = os.getenv("TRIGGER", ".eww").strip().lower()
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "1.5"))
@@ -434,7 +438,7 @@ def build_client():
 
 
 # --------------------------------------------------------------------------- #
-# follow gate
+# follow gate — check only, no follow back
 # --------------------------------------------------------------------------- #
 _follow_cache = {}
 _follow_lock = threading.Lock()
@@ -448,15 +452,13 @@ def _friendship(cl, uid):
         try:
             fs = fn(uid)
             if hasattr(fs, "followed_by"):
-                return {"followed_by": bool(fs.followed_by),
-                        "following": bool(getattr(fs, "following", False))}
+                return bool(fs.followed_by)
         except Exception as e:
             log("friendship via", name, "failed:", e)
     try:
         raw = cl.private_request(f"friendships/show/{uid}/")
         if isinstance(raw, dict):
-            return {"followed_by": bool(raw.get("followed_by")),
-                    "following": bool(raw.get("following"))}
+            return bool(raw.get("followed_by"))
     except Exception as e:
         log("friendship via private_request failed:", e)
     return None
@@ -470,10 +472,8 @@ def is_follower(cl, uid, force=False):
         if hit and not force and now - hit[1] < FOLLOW_CACHE_TTL:
             return hit[0]
 
-    fs = _friendship(cl, uid)
-    if fs is not None:
-        verdict = fs["followed_by"]
-    else:
+    verdict = _friendship(cl, uid)
+    if verdict is None:
         with LOCK:
             known = {int(x) for x in STATE.get("known_followers", [])}
         verdict = uid in known if known else (hit[0] if hit else True)
@@ -497,41 +497,9 @@ def fetch_followers(cl, amount):
     return None
 
 
-def follow_back_one(cl, uid):
-    try:
-        cl.user_follow(uid)
-    except Exception as e:
-        log("follow back failed for", uid, e)
-        return False
-
-    handle = str(uid)
-    try:
-        info = cl.user_info(uid)
-        handle = f"@{info.username}"
-        touch_user(uid, info.username, info.full_name)
-    except Exception:
-        pass
-
-    with _follow_lock:
-        _follow_cache[uid] = (True, time.time())
-    log("followed back", handle)
-    tg_note(f"new follower, followed back: {handle}")
-    return True
-
-
-def follow_back_loop(cl):
-    """Tight newest-follower watch + slow full reconcile."""
+def follower_watch(cl):
+    """Keep the local follower set fresh so the gate survives API hiccups."""
     known = {int(x) for x in STATE.get("known_followers", [])}
-
-    if not known:
-        base = fetch_followers(cl, 0)
-        if base:
-            known = base
-            with LOCK:
-                STATE["known_followers"] = sorted(known)
-            save_state()
-            log("follower baseline:", len(known))
-
     last_full = time.time()
 
     while not _stop.is_set():
@@ -544,15 +512,12 @@ def follow_back_loop(cl):
             fresh = live - known
             if fresh:
                 log("new follower(s):", len(fresh))
+                tg_note(f"new follower(s): {len(fresh)}")
                 for uid in fresh:
-                    follow_back_one(cl, uid)
-                    time.sleep(0.6)
-                known |= fresh
-                with LOCK:
-                    STATE["known_followers"] = sorted(known)
-                save_state()
-            elif full:
-                known = live
+                    with _follow_lock:
+                        _follow_cache[uid] = (True, time.time())
+            if fresh or full:
+                known = live if full else (known | fresh)
                 with LOCK:
                     STATE["known_followers"] = sorted(known)
                 save_state()
@@ -607,7 +572,6 @@ def dashboard(cl, thread, msg, uid):
     rec = STATE["users"].get(str(uid), {})
     used = usage_today(uid)
     base = base_limit(uid)
-    cred = credits(uid)
     following = is_follower(cl, uid)
 
     lines = []
@@ -620,7 +584,7 @@ def dashboard(cl, thread, msg, uid):
         "◌ " + styled("name") + " ⇝ " + (rec.get("name") or getattr(u, "full_name", None) or "-"),
         "◌ " + styled("saved today") + f" ⇝ {used}/{base}",
         "◌ " + styled("free left") + f" ⇝ {max(0, base - used)}",
-        "◌ " + styled("credits") + f" ⇝ {cred}",
+        "◌ " + styled("credits") + f" ⇝ {credits(uid)}",
         "◌ " + styled("archived") + f" ⇝ {rec.get('archived', 0)}",
         "◌ " + styled("following bot") + " ⇝ " + ("✅" if following else "❌"),
         "◌ " + styled("reset") + " ⇝ 00:00 IST",
@@ -722,7 +686,7 @@ def bot_card(cl, thread, msg):
         styled("saves view once photos and videos from instagram group chats and dms before they expire"),
         styled("reply") + f" {TRIGGER} " + styled("to any view once snap and it lands in your dm"),
         "",
-        "◌ " + styled("works for") + " ⇝ " + styled("followers only, follows back automatically"),
+        "◌ " + styled("works for") + " ⇝ " + styled("followers only"),
         "◌ " + styled("free saves") + f" ⇝ {DAILY_LIMIT} " + styled("per day"),
         "◌ " + styled("reset") + " ⇝ 00:00 IST",
         "◌ " + styled("extra saves") + " ⇝ " + styled("credits from admins"),
@@ -939,10 +903,8 @@ def handle_trigger(cl, thread, msg, cache):
         send_text(cl, thread, msg, styled("you are banned from using this bot"), reply=True)
         return
 
-    # force a fresh verdict so a just-followed user is never turned away
     if not is_follower(cl, uid, force=True):
         log("  not a follower")
-        _follow_wake.set()
         send_text(cl, thread, msg, follow_prompt(msg), reply=True)
         return
 
@@ -1198,7 +1160,6 @@ def realtime_thread(cl):
 
     try:
         cl.realtime_on("on_new_follower", lambda payload: _follow_wake.set())
-        log("realtime follower hook on")
     except Exception:
         pass
 
@@ -1260,7 +1221,7 @@ def main():
         log(traceback.format_exc())
     save_state()
 
-    threading.Thread(target=follow_back_loop, args=(cl,), daemon=True).start()
+    threading.Thread(target=follower_watch, args=(cl,), daemon=True).start()
     if TG_ENABLED:
         threading.Thread(target=backup_loop, daemon=True).start()
     if os.environ.get("REALTIME", "1") == "1":
