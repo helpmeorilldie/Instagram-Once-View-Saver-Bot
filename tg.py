@@ -11,12 +11,50 @@ BASE = f"https://api.telegram.org/bot{C.TG_TOKEN}"
 FILE_BASE = f"https://api.telegram.org/file/bot{C.TG_TOKEN}"
 
 
-def call(method: str, timeout: int = 60, **payload):
-    r = requests.post(f"{BASE}/{method}", data=payload, timeout=timeout)
-    data = r.json()
-    if not data.get("ok"):
+def _safe(e) -> str:
+    """requests exceptions embed the full URL, which contains the bot token."""
+    s = str(e)
+    return s.replace(C.TG_TOKEN, "<token>") if C.TG_TOKEN else s
+
+
+def _post(method, payload, http_timeout, file=None, attempts=4):
+    """POST to the Bot API. Retries connection errors and 429 flood waits only,
+    so a timed-out send is never blindly repeated."""
+    last = None
+    for attempt in range(attempts):
+        fh = None
+        try:
+            kw = {"data": payload, "timeout": http_timeout}
+            if file:
+                field, path = file
+                fh = open(path, "rb")
+                kw["files"] = {field: (path.name, fh)}
+            r = requests.post(f"{BASE}/{method}", **kw)
+        except requests.ConnectionError as e:
+            last = RuntimeError(f"telegram {method}: {_safe(e)}")
+            time.sleep(1 + attempt)
+            continue
+        except requests.RequestException as e:
+            raise RuntimeError(f"telegram {method}: {_safe(e)}") from None
+        finally:
+            if fh:
+                fh.close()
+        try:
+            data = r.json()
+        except ValueError:
+            raise RuntimeError(f"telegram {method}: bad response ({r.status_code})") from None
+        if data.get("ok"):
+            return data["result"]
+        wait = (data.get("parameters") or {}).get("retry_after")
+        if data.get("error_code") == 429 and wait and attempt < attempts - 1:
+            time.sleep(wait + 1)
+            continue
         raise RuntimeError(f"telegram {method}: {data.get('description')}")
-    return data["result"]
+    raise last or RuntimeError(f"telegram {method}: failed")
+
+
+def call(method: str, http_timeout: int = 60, **payload):
+    return _post(method, payload, http_timeout)
 
 
 def send_text(chat, text, reply_to=None, markup=None):
@@ -26,21 +64,20 @@ def send_text(chat, text, reply_to=None, markup=None):
         payload["reply_to_message_id"] = reply_to
     if markup:
         payload["reply_markup"] = json.dumps(markup)
-    return call("sendMessage", **payload)
+    try:
+        return call("sendMessage", **payload)
+    except RuntimeError as e:
+        # A stray "<" in the text makes Telegram reject the whole message.
+        # Fall back to plain text rather than dropping it.
+        if "parse entities" not in str(e):
+            raise
+        payload.pop("parse_mode")
+        return call("sendMessage", **payload)
 
 
 def send_doc(chat, path, caption=""):
-    with open(path, "rb") as fh:
-        r = requests.post(
-            f"{BASE}/sendDocument",
-            data={"chat_id": chat, "caption": caption[:1000]},
-            files={"document": (path.name, fh)},
-            timeout=300,
-        )
-    data = r.json()
-    if not data.get("ok"):
-        raise RuntimeError(f"telegram sendDocument: {data.get('description')}")
-    return data["result"]
+    return _post("sendDocument", {"chat_id": chat, "caption": caption[:1000]},
+                 300, file=("document", path))
 
 
 def pin(chat, message_id, notify=False):
@@ -63,6 +100,7 @@ def delete(chat, message_id):
 
 
 def download(file_id, dest):
+    # NOTE: the Bot API only lets bots download files up to 20 MB.
     path = call("getFile", file_id=file_id)["file_path"]
     with requests.get(f"{FILE_BASE}/{path}", stream=True, timeout=300) as r:
         r.raise_for_status()
@@ -93,8 +131,11 @@ class Poller(threading.Thread):
     def run(self):
         while self.alive:
             try:
-                updates = call("getUpdates", timeout=70,
-                               offset=self.offset, **{"timeout": 30})
+                # `timeout` is Telegram's long-poll seconds; the HTTP timeout
+                # is a separate argument and must be larger.
+                updates = call("getUpdates", http_timeout=45, timeout=30,
+                               offset=self.offset,
+                               allowed_updates=json.dumps(["message", "channel_post"]))
                 for upd in updates:
                     self.offset = upd["update_id"] + 1
                     msg = upd.get("message") or upd.get("channel_post")
@@ -102,7 +143,8 @@ class Poller(threading.Thread):
                         try:
                             self.handler(msg)
                         except Exception as e:
-                            print("tg handler:", e)
+                            print("tg handler:", _safe(e))
             except Exception as e:
-                print("tg poll:", e)
-                time.sleep(3)
+                print("tg poll:", _safe(e))
+                # 409 = another copy of the bot is polling with the same token
+                time.sleep(10 if "Conflict" in str(e) else 3)
