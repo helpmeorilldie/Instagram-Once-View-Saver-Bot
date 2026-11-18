@@ -411,3 +411,40 @@ def poll(cl, process=True, seen_users=None):
                 except Exception:
                     log(traceback.format_exc())
                 time.sleep(1)
+# ------------------------------ client -------------------------------------- #
+SETTINGS_FILE = C.DATA_DIR / "settings.json"
+
+
+def build_client():
+    cl = Client()
+    cl.delay_range = [1, 3]
+    if SETTINGS_FILE.exists():
+        try:
+            cl.load_settings(SETTINGS_FILE)
+            cl.login_by_sessionid(C.IG_SESSIONID)
+            cl.get_timeline_feed()
+            log("logged in with cached device settings")
+            return cl
+        except Exception as e:
+            log("cached settings failed (%s), re-logging" % e)
+
+    cl = Client()
+    cl.delay_range = [1, 3]
+    cl.login_by_sessionid(C.IG_SESSIONID)
+    C.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    cl.dump_settings(SETTINGS_FILE)
+    log("logged in as", cl.username, "(uid %s)" % cl.user_id)
+    return cl
+
+
+def realtime_thread(cl):
+    """MQTT nudge so replies land in under a second."""
+    try:
+        cl.realtime_on("direct", lambda payload: _wake.set())
+        rt = cl.realtime_connect()
+        rt.direct_subscribe()
+        log("realtime subscribed")
+        while not _stop.is_set():
+            cl.realtime_read_once()
+    except Exception as e:
+        log("realtime disabled:", e)
