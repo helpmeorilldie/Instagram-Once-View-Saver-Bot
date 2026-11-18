@@ -570,7 +570,7 @@ def follow_back_loop(cl):
 
     while not _stop.is_set():
         full = time.time() - last_full >= FOLLOW_FULL
-        live = fetch_followers(cl, 0 if full else 2)
+        live = fetch_followers(cl, 0 if full else 1)
         if full:
             last_full = time.time()
 
