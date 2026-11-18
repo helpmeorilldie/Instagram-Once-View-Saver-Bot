@@ -37,7 +37,6 @@ def boot():
         except Exception as e:
             print("STORAGE CHANNEL BAD:", e)
     cl = igbot.build_client()
-    cl.user_id = cl.user_id
     resolve_admins(cl)
 
     if C.TG_TOKEN:
