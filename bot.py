@@ -13,9 +13,8 @@ Env vars:
   DATA_DIR          storage dir (default ./data)
 
   DAILY_LIMIT       base saves per user per day, resets 00:00 IST (default 10)
-  FOLLOW_CACHE_TTL  seconds a follow verdict is trusted (default 20)
-  FOLLOW_FAST       seconds between new-follower checks (default 6)
-  FOLLOW_FULL       seconds between full follower reconciles (default 240)
+  FOLLOW_CACHE_TTL  seconds a follow verdict is cached for display (default 20)
+  REQUEST_POLL      seconds between request/hidden inbox sweeps (default 5)
   WORKERS           trigger worker threads (default 3)
 
   ADMINS            comma separated usernames with .admin access
@@ -64,8 +63,7 @@ DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 
 DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "10"))
 FOLLOW_CACHE_TTL = float(os.getenv("FOLLOW_CACHE_TTL", "20"))
-FOLLOW_FAST = float(os.getenv("FOLLOW_FAST", "6"))
-FOLLOW_FULL = float(os.getenv("FOLLOW_FULL", "240"))
+REQUEST_POLL = float(os.getenv("REQUEST_POLL", "5"))
 WORKERS = int(os.getenv("WORKERS", "3"))
 
 ADMINS_ENV = [
@@ -94,6 +92,7 @@ ABOUT_CMD = ".about"
 ADMIN_CMD = ".admin"
 HELP_CMD = ".help"
 WELCOME_CMD = ".wlcum"
+FLWME_CMD = ".flwme"
 PENDING_TTL = 300
 
 DEV_HANDLE = "@noxmirage_"
@@ -101,7 +100,6 @@ DEV_NAME = "❕Miranox"
 CREDIT = "Bʏ ‣ @Noxmirage_ ~𝑯𝒂𝒛𝒆"
 
 _wake = threading.Event()
-_follow_wake = threading.Event()
 _stop = threading.Event()
 START = time.time()
 
@@ -211,7 +209,7 @@ def _blank_state():
     return {
         "seen": {}, "window": {}, "known_followers": [], "users": {}, "threads": {},
         "stats": {}, "welcome": {}, "members": {}, "admins": [], "banned": [],
-        "archive_total": 0, "created": time.time(),
+        "archive_total": 0, "bot_uid": "", "created": time.time(),
     }
 
 
@@ -423,7 +421,7 @@ def build_client():
 
 
 # --------------------------------------------------------------------------- #
-# follow gate
+# follow state
 # --------------------------------------------------------------------------- #
 _follow_cache = {}
 _follow_lock = threading.Lock()
@@ -452,6 +450,7 @@ def _friendship(cl, uid):
 
 
 def is_follower(cl, uid, force=False):
+    """One live friendship check. Permissive when the API misbehaves."""
     uid = int(uid)
     now = time.time()
     with _follow_lock:
@@ -460,20 +459,42 @@ def is_follower(cl, uid, force=False):
             return hit[0]
 
     fs = _friendship(cl, uid)
-    if fs is not None:
-        verdict = fs["followed_by"]
-    else:
-        with LOCK:
-            known = {int(x) for x in STATE.get("known_followers", [])}
-        verdict = uid in known if known else (hit[0] if hit else True)
+    verdict = fs["followed_by"] if fs is not None else True
 
     with _follow_lock:
         _follow_cache[uid] = (verdict, now)
     return verdict
 
 
+def follows_bot(cl, uid):
+    fs = _friendship(cl, int(uid))
+    return bool(fs and fs.get("following"))
+
+
+def follow_user(cl, uid):
+    try:
+        cl.user_follow(int(uid))
+    except Exception as e:
+        log("follow failed for", uid, e)
+        return False
+
+    handle = str(uid)
+    try:
+        info = cl.user_info(uid)
+        handle = f"@{info.username}"
+        touch_user(uid, info.username, info.full_name)
+    except Exception:
+        pass
+
+    with _follow_lock:
+        _follow_cache[int(uid)] = (True, time.time())
+    log("followed", handle)
+    tg_note(f".flwme followed: {handle}")
+    return True
+
+
 def fetch_followers(cl, amount):
-    """Safely fetch follower IDs from supported response formats."""
+    """One-shot follower snapshot, used for the admin count only."""
 
     for name in ("user_followers_v1", "user_followers"):
         fn = getattr(cl, name, None)
@@ -488,14 +509,10 @@ def fetch_followers(cl, amount):
                 log("Follower API returned empty response:", name)
                 continue
 
-            # Handle dictionary responses
             if isinstance(data, dict):
                 users = data.values()
-
-            # Handle list responses
             elif isinstance(data, (list, tuple, set)):
                 users = data
-
             else:
                 log("Unexpected follower response:", type(data).__name__)
                 continue
@@ -531,68 +548,30 @@ def fetch_followers(cl, amount):
     return None
 
 
-def follow_back_one(cl, uid):
-    try:
-        cl.user_follow(uid)
-    except Exception as e:
-        log("follow back failed for", uid, e)
-        return False
+def sync_bot_uid(cl):
+    """Wipe follower data when the bot account changed, then snapshot once."""
+    prev = str(STATE.get("bot_uid") or "")
+    current = str(cl.user_id)
 
-    handle = str(uid)
-    try:
-        info = cl.user_info(uid)
-        handle = f"@{info.username}"
-        touch_user(uid, info.username, info.full_name)
-    except Exception:
-        pass
+    if prev and prev != current:
+        log("bot account changed", prev, "->", current, "| dropping old follower data")
+        with LOCK:
+            STATE["known_followers"] = []
+            STATE["bot_uid"] = current
+        with _follow_lock:
+            _follow_cache.clear()
+        save_state()
+    elif not prev:
+        with LOCK:
+            STATE["bot_uid"] = current
+        save_state()
 
-    with _follow_lock:
-        _follow_cache[uid] = (True, time.time())
-    log("followed back", handle)
-    tg_note(f"new follower, followed back: {handle}")
-    return True
-
-
-def follow_back_loop(cl):
-    """Tight newest-follower watch + slow full reconcile."""
-    known = {int(x) for x in STATE.get("known_followers", [])}
-
-    if not known:
-        base = fetch_followers(cl, 0)
-        if base:
-            known = base
-            with LOCK:
-                STATE["known_followers"] = sorted(known)
-            save_state()
-            log("follower baseline:", len(known))
-
-    last_full = time.time()
-
-    while not _stop.is_set():
-        full = time.time() - last_full >= FOLLOW_FULL
-        live = fetch_followers(cl, 0 if full else 1)
-        if full:
-            last_full = time.time()
-
-        if live is not None:
-            fresh = live - known
-            if fresh:
-                log("new follower(s):", len(fresh))
-                for uid in fresh:
-                    follow_back_one(cl, uid)
-                    time.sleep(0.6)
-                known |= fresh
-                with LOCK:
-                    STATE["known_followers"] = sorted(known)
-                save_state()
-            elif full:
-                known = live
-                with LOCK:
-                    STATE["known_followers"] = sorted(known)
-                save_state()
-
-        _follow_wake.wait(FOLLOW_FAST)
-        _follow_wake.clear()
+    snap = fetch_followers(cl, 0)
+    if snap:
+        with LOCK:
+            STATE["known_followers"] = sorted(snap)
+        save_state()
+        log("follower snapshot:", len(snap))
 
 
 # --------------------------------------------------------------------------- #
@@ -614,6 +593,21 @@ def send_text(cl, thread, msg, text, reply=False):
         log("send_text failed:", e)
 
 
+def approve_thread(cl, thread):
+    """Accept a pending / hidden request so the reply is actually deliverable."""
+    for name in ("direct_pending_approve", "direct_request_approve"):
+        fn = getattr(cl, name, None)
+        if fn is None:
+            continue
+        try:
+            fn(thread.id)
+            log("approved request", thread.id)
+            return True
+        except Exception as e:
+            log("approve via", name, "failed:", e)
+    return False
+
+
 def follow_prompt(msg):
     u = getattr(msg, "user", None)
     name = (getattr(u, "full_name", None) or getattr(u, "username", None) or "there")
@@ -621,7 +615,7 @@ def follow_prompt(msg):
         f"👋 {styled('hey')} {name}!",
         styled("follow the bot account first to use it"),
         f"‣ @{BOT_USERNAME}",
-        styled("then send") + f" {TRIGGER} " + styled("again"),
+        styled("then send") + f" {FLWME_CMD} " + styled("to get followed back"),
         "", CREDIT,
     ])
 
@@ -646,7 +640,12 @@ def dashboard(cl, thread, msg, uid):
 
     lines = []
     if not following:
-        lines += [styled("you are not following the bot"), f"‣ @{BOT_USERNAME}", ""]
+        lines += [
+            styled("you are not following the bot"),
+            f"‣ @{BOT_USERNAME}",
+            styled("follow then send") + f" {FLWME_CMD}",
+            "",
+        ]
 
     lines += [
         "🎗️ " + styled("user profile"),
@@ -670,12 +669,54 @@ def help_card(cl, thread, msg):
     send_text(cl, thread, msg, "\n".join([
         "📖 " + styled("commands"),
         f"{TRIGGER} ⇝ " + styled("reply to a view once snap to save it"),
+        f"{FLWME_CMD} ⇝ " + styled("follow the bot, get followed back"),
         f"{STATS_CMD} ⇝ " + styled("your profile and quota"),
         f"{ABOUT_CMD} @" + styled("user") + " ⇝ " + styled("info on a gc member"),
         f"{ABOUT_CMD} @" + BOT_USERNAME + " ⇝ " + styled("about this bot"),
         f"{WELCOME_CMD} ⇝ " + styled("gc welcome, admins only"),
         "", CREDIT,
     ]))
+
+
+# --------------------------------------------------------------------------- #
+# .flwme
+# --------------------------------------------------------------------------- #
+def flwme_cmd(cl, thread, msg):
+    uid = int(msg.user_id)
+    u = getattr(msg, "user", None)
+    touch_user(uid, getattr(u, "username", None), getattr(u, "full_name", None))
+
+    if is_banned(uid):
+        send_text(cl, thread, msg, styled("you are banned from using this bot"), reply=True)
+        return
+
+    handle = "@" + ((STATE["users"].get(str(uid)) or {}).get("username")
+                    or getattr(u, "username", None) or str(uid))
+
+    if not is_follower(cl, uid, force=True):
+        log("  .flwme from non-follower", uid)
+        send_text(cl, thread, msg, follow_prompt(msg), reply=True)
+        return
+
+    if follows_bot(cl, uid):
+        send_text(cl, thread, msg, "\n".join([
+            "✅ " + styled("already following you back"),
+            "◌ " + styled("user") + f" ⇝ {handle}",
+            "", CREDIT,
+        ]), reply=True)
+        return
+
+    if follow_user(cl, uid):
+        send_text(cl, thread, msg, "\n".join([
+            "✅ " + styled("followed back"),
+            "◌ " + styled("user") + f" ⇝ {handle}",
+            styled("reply") + f" {TRIGGER} " + styled("to any view once snap"),
+            "", CREDIT,
+        ]), reply=True)
+    else:
+        send_text(cl, thread, msg,
+                  styled("couldn't follow right now, try") + f" {FLWME_CMD} " + styled("again"),
+                  reply=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -756,7 +797,8 @@ def bot_card(cl, thread, msg):
         styled("saves view once photos and videos from instagram group chats and dms before they expire"),
         styled("reply") + f" {TRIGGER} " + styled("to any view once snap and it lands in your dm"),
         "",
-        "◌ " + styled("works for") + " ⇝ " + styled("followers only, follows back automatically"),
+        "◌ " + styled("works for") + " ⇝ " + styled("followers only"),
+        f"◌ " + styled("get followed back") + f" ⇝ {FLWME_CMD}",
         "◌ " + styled("free saves") + f" ⇝ {DAILY_LIMIT} " + styled("per day"),
         "◌ " + styled("reset") + " ⇝ 00:00 IST",
         "◌ " + styled("extra saves") + " ⇝ " + styled("credits from admins"),
@@ -973,10 +1015,9 @@ def handle_trigger(cl, thread, msg, cache):
         send_text(cl, thread, msg, styled("you are banned from using this bot"), reply=True)
         return
 
-    # force a fresh verdict so a just-followed user is never turned away
+    # fresh verdict at trigger time — no loop, no stale set
     if not is_follower(cl, uid, force=True):
         log("  not a follower")
-        _follow_wake.set()
         send_text(cl, thread, msg, follow_prompt(msg), reply=True)
         return
 
@@ -1144,9 +1185,46 @@ def track_window(thread):
         STATE["window"][tid] = current
 
 
-def poll(cl, process=True):
-    threads = cl.direct_threads(amount=12, thread_message_limit=20)
-    for thread in threads:
+def collect_threads(cl, with_requests=False):
+    """Main inbox, plus pending and hidden request boxes when due."""
+    out, seen = [], set()
+
+    try:
+        for t in cl.direct_threads(amount=12, thread_message_limit=20):
+            if t.id in seen:
+                continue
+            seen.add(t.id)
+            out.append((t, "inbox"))
+    except Exception as e:
+        log("inbox fetch failed:", e)
+
+    if not with_requests:
+        return out
+
+    sources = (("direct_pending_inbox", "request"), ("direct_spam_inbox", "hidden"))
+    for name, kind in sources:
+        fn = getattr(cl, name, None)
+        if fn is None:
+            continue
+        try:
+            for t in fn(amount=15) or []:
+                if t.id in seen:
+                    continue
+                seen.add(t.id)
+                if not getattr(t, "messages", None):
+                    try:
+                        t = cl.direct_thread(t.id)
+                    except Exception:
+                        pass
+                out.append((t, kind))
+        except Exception as e:
+            log(kind, "inbox fetch failed:", e)
+
+    return out
+
+
+def poll(cl, process=True, with_requests=False):
+    for thread, kind in collect_threads(cl, with_requests and process):
         if ONLY_THREADS and str(thread.id) not in ONLY_THREADS:
             continue
 
@@ -1175,9 +1253,20 @@ def poll(cl, process=True):
             if hit:
                 cache[m.id] = hit
 
-        for m in reversed(thread.messages):
-            if was_seen(thread.id, m.id):
-                continue
+        unseen = [m for m in reversed(thread.messages) if not was_seen(thread.id, m.id)]
+
+        # accept the request before replying, but only for followers or command senders
+        if unseen and kind != "inbox":
+            for m in unseen:
+                if str(m.user_id) == str(cl.user_id):
+                    continue
+                low = (m.text or "").strip().lower()
+                if is_follower(cl, int(m.user_id)) or low in (
+                        TRIGGER, FLWME_CMD, HELP_CMD, STATS_CMD, ADMIN_CMD, ABOUT_CMD):
+                    approve_thread(cl, thread)
+                    break
+
+        for m in unseen:
             mark_seen(thread.id, m.id)
             if not process:
                 continue
@@ -1194,6 +1283,9 @@ def poll(cl, process=True):
                 continue
             if low.startswith(WELCOME_CMD):
                 welcome_cmd(cl, thread, m, text[len(WELCOME_CMD):])
+                continue
+            if low.startswith(FLWME_CMD):
+                flwme_cmd(cl, thread, m)
                 continue
             if low.startswith(ABOUT_CMD):
                 about_card(cl, thread, m, text[len(ABOUT_CMD):])
@@ -1231,12 +1323,6 @@ def realtime_thread(cl):
         log("realtime direct hook failed:", e)
 
     try:
-        cl.realtime_on("on_new_follower", lambda payload: _follow_wake.set())
-        log("realtime follower hook on")
-    except Exception:
-        pass
-
-    try:
         rt = cl.realtime_connect()
         rt.direct_subscribe()
         log("realtime subscribed")
@@ -1270,6 +1356,8 @@ def main():
     BOT_USERNAME = cl.username
     log("bot account:", BOT_USERNAME, "| base limit", DAILY_LIMIT, "/day IST")
 
+    sync_bot_uid(cl)
+
     ids = admin_ids()
     for name in ADMINS_ENV:
         try:
@@ -1289,29 +1377,33 @@ def main():
 
     log("seeding existing messages...")
     try:
-        poll(cl, process=PROCESS_BACKLOG)
+        poll(cl, process=PROCESS_BACKLOG, with_requests=True)
     except Exception:
         log(traceback.format_exc())
     save_state()
 
-    threading.Thread(target=follow_back_loop, args=(cl,), daemon=True).start()
     if TG_ENABLED:
         threading.Thread(target=backup_loop, daemon=True).start()
     if os.environ.get("REALTIME", "1") == "1":
         threading.Thread(target=realtime_thread, args=(cl,), daemon=True).start()
 
     last_save = last_keepalive = time.time()
-    log("watching for", TRIGGER, "every", POLL_INTERVAL, "s")
+    last_req = 0.0
+    log("watching for", TRIGGER, "and", FLWME_CMD, "every", POLL_INTERVAL, "s")
 
     while not _stop.is_set():
         _wake.wait(POLL_INTERVAL)
         _wake.clear()
+        due = time.time() - last_req >= REQUEST_POLL
+        if due:
+            last_req = time.time()
         try:
-            poll(cl)
+            poll(cl, with_requests=due)
         except LoginRequired:
             log("session died, re-logging")
             try:
                 cl = build_client()
+                sync_bot_uid(cl)
             except Exception:
                 log(traceback.format_exc())
                 time.sleep(20)
