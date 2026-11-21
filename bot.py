@@ -5,7 +5,7 @@ IG .eww snap saver — single-file build.
 Env vars:
   IG_SESSIONID      (required) value of the `sessionid` cookie
   TRIGGER           (default ".eww")
-  POLL_INTERVAL     seconds between inbox polls (default 1.5)
+  POLL_INTERVAL     seconds between inbox polls (default 3)
   ONLY_THREADS      comma separated thread ids to restrict to
   PROCESS_BACKLOG   "1" to handle old messages on startup
   DRY_RUN           "1" to download but not send
@@ -14,8 +14,18 @@ Env vars:
 
   DAILY_LIMIT       base saves per user per day, resets 00:00 IST (default 10)
   FOLLOW_CACHE_TTL  seconds a follow verdict is cached for display (default 20)
-  REQUEST_POLL      seconds between request/hidden inbox sweeps (default 5)
+  REQUEST_POLL      seconds between request/hidden inbox sweeps (default 15)
   WORKERS           trigger worker threads (default 3)
+
+  FOLLOW_PER_HOUR   max outbound follows per hour (default 25)
+  FOLLOW_PER_DAY    max outbound follows per day (default 180)
+  BROADCAST_CAP     max targets per broadcast run (default 60)
+  BROADCAST_DELAY   "min,max" seconds between broadcast sends (default 4,9)
+  REPLY_JITTER      "min,max" seconds before DMing a saver (default 0.5,1.6)
+  FOLLOWER_SYNC_AMOUNT  follower ids pulled per snapshot (default 300)
+  FOLLOWER_SYNC_TTL     seconds a follower snapshot is trusted (default 21600)
+  IG_PROXY          http://user:pass@host:port residential proxy (optional)
+  REALTIME          "0" to disable the realtime hook (default 1)
 
   ADMINS            comma separated usernames with .admin access
   TG_BOT_TOKEN      telegram bot token (optional)
@@ -27,6 +37,7 @@ Env vars:
 import json
 import os
 import queue
+import random
 import signal
 import sys
 import threading
@@ -50,10 +61,10 @@ load_dotenv()
 # --------------------------------------------------------------------------- #
 SESSIONID = os.getenv("IG_SESSIONID", "").strip()
 TRIGGER = os.getenv("TRIGGER", ".eww").strip().lower()
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "1.5"))
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "3"))
 PROCESS_BACKLOG = os.getenv("PROCESS_BACKLOG") == "1"
 DRY_RUN = os.getenv("DRY_RUN") == "1"
-MAX_BYTES = int(float(os.getenv("MAX_MB", "60")) * 1024 * 1024)
+MAX_BYTES = int(float(os.getenv("MAX_MB", "60")) * 1024 * 1920)
 ONLY_THREADS = {
     t.strip()
     for t in os.getenv("ONLY_THREADS", "").split(",")
@@ -63,8 +74,17 @@ DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 
 DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "10"))
 FOLLOW_CACHE_TTL = float(os.getenv("FOLLOW_CACHE_TTL", "20"))
-REQUEST_POLL = float(os.getenv("REQUEST_POLL", "5"))
+REQUEST_POLL = float(os.getenv("REQUEST_POLL", "15"))
 WORKERS = int(os.getenv("WORKERS", "3"))
+
+FOLLOW_PER_HOUR = int(os.getenv("FOLLOW_PER_HOUR", "25"))
+FOLLOW_PER_DAY = int(os.getenv("FOLLOW_PER_DAY", "180"))
+BROADCAST_CAP = int(os.getenv("BROADCAST_CAP", "60"))
+BROADCAST_DELAY = tuple(float(x) for x in os.getenv("BROADCAST_DELAY", "4,9").split(","))
+REPLY_JITTER = tuple(float(x) for x in os.getenv("REPLY_JITTER", "0.5,1.6").split(","))
+FOLLOWER_SYNC_AMOUNT = int(os.getenv("FOLLOWER_SYNC_AMOUNT", "300"))
+FOLLOWER_SYNC_TTL = float(os.getenv("FOLLOWER_SYNC_TTL", "21600"))
+IG_PROXY = os.getenv("IG_PROXY", "").strip()
 
 ADMINS_ENV = [
     a.strip().lstrip("@").lower()
@@ -124,6 +144,10 @@ def styled(text):
 
 def log(*a):
     print(time.strftime("[%H:%M:%S]"), *a, flush=True)
+
+
+def nap(a=0.6, b=1.8):
+    time.sleep(random.uniform(a, b))
 
 
 def ist_str(ts):
@@ -209,6 +233,7 @@ def _blank_state():
     return {
         "seen": {}, "window": {}, "known_followers": [], "users": {}, "threads": {},
         "stats": {}, "welcome": {}, "members": {}, "admins": [], "banned": [],
+        "followed_back": [], "follow_log": [], "dm_users": {}, "follower_sync": 0,
         "archive_total": 0, "bot_uid": "", "created": time.time(),
     }
 
@@ -381,6 +406,8 @@ def tg_backup_db():
                 "archive_total": STATE.get("archive_total", 0),
                 "users": STATE.get("users", {}),
                 "known_followers": STATE.get("known_followers", []),
+                "followed_back": STATE.get("followed_back", []),
+                "dm_users": STATE.get("dm_users", {}),
                 "admins": STATE.get("admins", []),
                 "welcome": STATE.get("welcome", {}),
                 "threads": STATE.get("threads", {}),
@@ -400,7 +427,10 @@ def tg_backup_db():
 # --------------------------------------------------------------------------- #
 def build_client():
     cl = Client()
-    cl.delay_range = [0.4, 1.0]
+    cl.delay_range = [1.0, 2.5]
+    cl.request_timeout = 30
+    if IG_PROXY:
+        cl.set_proxy(IG_PROXY)
     if SETTINGS_FILE.exists():
         try:
             cl.load_settings(SETTINGS_FILE)
@@ -412,7 +442,10 @@ def build_client():
             log("cached settings failed (%s), re-logging" % e)
 
     cl = Client()
-    cl.delay_range = [0.4, 1.0]
+    cl.delay_range = [1.0, 2.5]
+    cl.request_timeout = 30
+    if IG_PROXY:
+        cl.set_proxy(IG_PROXY)
     cl.login_by_sessionid(SESSIONID)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     cl.dump_settings(SETTINGS_FILE)
@@ -449,13 +482,14 @@ def _friendship(cl, uid):
     return None
 
 
-def is_follower(cl, uid, force=False):
+def is_follower(cl, uid, max_age=None):
     """One live friendship check. Permissive when the API misbehaves."""
     uid = int(uid)
     now = time.time()
+    ttl = FOLLOW_CACHE_TTL if max_age is None else max_age
     with _follow_lock:
         hit = _follow_cache.get(uid)
-        if hit and not force and now - hit[1] < FOLLOW_CACHE_TTL:
+        if hit and now - hit[1] < ttl:
             return hit[0]
 
     fs = _friendship(cl, uid)
@@ -466,17 +500,51 @@ def is_follower(cl, uid, force=False):
     return verdict
 
 
+def bot_followed(uid):
+    with LOCK:
+        return int(uid) in {int(x) for x in STATE.get("followed_back", [])}
+
+
 def follows_bot(cl, uid):
     fs = _friendship(cl, int(uid))
-    return bool(fs and fs.get("following"))
+    if fs is not None and fs.get("following"):
+        return True
+    return bot_followed(uid)
+
+
+def follow_allowed():
+    now = time.time()
+    with LOCK:
+        log_ = [t for t in STATE.get("follow_log", []) if now - t < 86400]
+        STATE["follow_log"] = log_
+        if sum(1 for t in log_ if now - t < 3600) >= FOLLOW_PER_HOUR:
+            return False, "hourly follow cap reached"
+        if len(log_) >= FOLLOW_PER_DAY:
+            return False, "daily follow cap reached"
+        log_.append(now)
+    return True, ""
 
 
 def follow_user(cl, uid):
+    ok, why = follow_allowed()
+    if not ok:
+        log("follow skipped:", uid, why)
+        return False, why
+
+    nap(1.2, 3.0)
     try:
         cl.user_follow(int(uid))
     except Exception as e:
         log("follow failed for", uid, e)
-        return False
+        with LOCK:
+            if STATE["follow_log"]:
+                STATE["follow_log"].pop()
+        return False, str(e)
+
+    with LOCK:
+        fb = {int(x) for x in STATE.get("followed_back", [])}
+        fb.add(int(uid))
+        STATE["followed_back"] = sorted(fb)
 
     handle = str(uid)
     try:
@@ -488,9 +556,10 @@ def follow_user(cl, uid):
 
     with _follow_lock:
         _follow_cache[int(uid)] = (True, time.time())
+    save_state()
     log("followed", handle)
     tg_note(f".flwme followed: {handle}")
-    return True
+    return True, ""
 
 
 def fetch_followers(cl, amount):
@@ -549,7 +618,7 @@ def fetch_followers(cl, amount):
 
 
 def sync_bot_uid(cl):
-    """Wipe follower data when the bot account changed, then snapshot once."""
+    """Wipe follower data when the bot account changed, then snapshot at most once per TTL."""
     prev = str(STATE.get("bot_uid") or "")
     current = str(cl.user_id)
 
@@ -557,6 +626,9 @@ def sync_bot_uid(cl):
         log("bot account changed", prev, "->", current, "| dropping old follower data")
         with LOCK:
             STATE["known_followers"] = []
+            STATE["followed_back"] = []
+            STATE["dm_users"] = {}
+            STATE["follower_sync"] = 0
             STATE["bot_uid"] = current
         with _follow_lock:
             _follow_cache.clear()
@@ -566,10 +638,16 @@ def sync_bot_uid(cl):
             STATE["bot_uid"] = current
         save_state()
 
-    snap = fetch_followers(cl, 0)
+    last = float(STATE.get("follower_sync") or 0)
+    if time.time() - last < FOLLOWER_SYNC_TTL:
+        log("follower snapshot fresh, skipping")
+        return
+
+    snap = fetch_followers(cl, FOLLOWER_SYNC_AMOUNT)
     if snap:
         with LOCK:
             STATE["known_followers"] = sorted(snap)
+            STATE["follower_sync"] = time.time()
         save_state()
         log("follower snapshot:", len(snap))
 
@@ -693,7 +771,7 @@ def flwme_cmd(cl, thread, msg):
     handle = "@" + ((STATE["users"].get(str(uid)) or {}).get("username")
                     or getattr(u, "username", None) or str(uid))
 
-    if not is_follower(cl, uid, force=True):
+    if not is_follower(cl, uid, max_age=60):
         log("  .flwme from non-follower", uid)
         send_text(cl, thread, msg, follow_prompt(msg), reply=True)
         return
@@ -706,7 +784,8 @@ def flwme_cmd(cl, thread, msg):
         ]), reply=True)
         return
 
-    if follow_user(cl, uid):
+    ok, why = follow_user(cl, uid)
+    if ok:
         send_text(cl, thread, msg, "\n".join([
             "✅ " + styled("followed back"),
             "◌ " + styled("user") + f" ⇝ {handle}",
@@ -715,7 +794,7 @@ def flwme_cmd(cl, thread, msg):
         ]), reply=True)
     else:
         send_text(cl, thread, msg,
-                  styled("couldn't follow right now, try") + f" {FLWME_CMD} " + styled("again"),
+                  styled("couldn't follow right now") + f" ({why}), try {FLWME_CMD} " + styled("later"),
                   reply=True)
 
 
@@ -827,6 +906,8 @@ def admin_panel(cl, thread, msg):
         "◌ " + styled("threads") + f" ⇝ {len(STATE.get('threads', {}))}",
         "◌ " + styled("archived") + f" ⇝ {STATE.get('archive_total', 0)}",
         "◌ " + styled("followers") + f" ⇝ {len(STATE.get('known_followers', []))}",
+        "◌ " + styled("followed back") + f" ⇝ {len(STATE.get('followed_back', []))}",
+        "◌ " + styled("dm reachable") + f" ⇝ {len(STATE.get('dm_users', {}))}",
         "◌ " + styled("admins") + f" ⇝ {len(admin_ids())}",
         "◌ " + styled("banned") + f" ⇝ {len(STATE.get('banned', []))}",
         "◌ " + styled("uptime") + f" ⇝ {dur(time.time() - START)}",
@@ -872,6 +953,8 @@ def admin_cmd(cl, thread, msg, body):
             "◌ " + styled("credits outstanding") + f" ⇝ {sum(int(r.get('credits', 0)) for r in users.values())}",
             "◌ " + styled("archived total") + f" ⇝ {STATE.get('archive_total', 0)}",
             "◌ " + styled("known followers") + f" ⇝ {len(STATE.get('known_followers', []))}",
+            "◌ " + styled("followed back") + f" ⇝ {len(STATE.get('followed_back', []))}",
+            "◌ " + styled("dm reachable") + f" ⇝ {len(STATE.get('dm_users', {}))}",
             "◌ " + styled("uptime") + f" ⇝ {dur(time.time() - START)}",
             "", CREDIT,
         ]), reply=True)
@@ -954,7 +1037,10 @@ def admin_cmd(cl, thread, msg, body):
         text = body[len("broadcast"):].strip()
         if not text:
             return send_text(cl, thread, msg, styled("give text to broadcast"), reply=True)
-        send_text(cl, thread, msg, styled("broadcasting..."), reply=True)
+        n = len(broadcast_targets())
+        send_text(cl, thread, msg,
+                  styled("broadcasting to") + f" {min(n, BROADCAST_CAP)}/{n} " + styled("eligible"),
+                  reply=True)
         JOB_Q.put((broadcast_job, (cl, text)))
         return
 
@@ -966,16 +1052,58 @@ def admin_cmd(cl, thread, msg, body):
     return admin_panel(cl, thread, msg)
 
 
+def broadcast_targets():
+    with LOCK:
+        dm = dict(STATE.get("dm_users", {}))
+        followed = {int(x) for x in STATE.get("followed_back", [])}
+        banned = {int(x) for x in STATE.get("banned", [])}
+        bot = int(STATE.get("bot_uid") or 0)
+
+    targets, seen = [], set()
+    for uid_s, tid in dm.items():
+        uid = int(uid_s)
+        if uid in banned or uid == bot:
+            continue
+        seen.add(uid)
+        targets.append((uid, tid))
+    for uid in sorted(followed):
+        if uid in seen or uid in banned:
+            continue
+        targets.append((uid, None))
+    return targets
+
+
 def broadcast_job(cl, text):
+    targets = broadcast_targets()
+    if not targets:
+        tg_note("broadcast: no eligible targets (nobody has DM'd or been followed back)")
+        return
+
+    cap = min(len(targets), BROADCAST_CAP)
     sent = failed = 0
-    for uid in list(STATE.get("users", {}).keys()):
-        try:
-            cl.direct_send(text, user_ids=[int(uid)])
+    log(f"broadcast start: {cap}/{len(targets)} targets")
+
+    for uid, tid in targets[:cap]:
+        if DRY_RUN:
+            log("DRY_RUN broadcast ->", uid)
             sent += 1
-        except Exception:
+            continue
+        try:
+            if tid:
+                cl.direct_send(text, thread_ids=[tid])
+            else:
+                cl.direct_send(text, user_ids=[uid])
+            sent += 1
+        except DirectMessageRequestsDisabled:
             failed += 1
-        time.sleep(1.2)
-    tg_note(f"broadcast done: sent {sent}, failed {failed}")
+        except Exception as e:
+            failed += 1
+            log("broadcast fail", uid, e)
+        time.sleep(random.uniform(*BROADCAST_DELAY))
+
+    note = f"broadcast done: sent {sent}, failed {failed}, skipped {len(targets) - cap}"
+    log(note)
+    tg_note(note)
 
 
 # --------------------------------------------------------------------------- #
@@ -989,11 +1117,12 @@ def send_to(cl, thread, msg, path, ext):
 
     if thread.is_group:
         try:
+            nap(*REPLY_JITTER)
             cl.direct_send(styled("saved your") + f" {TRIGGER}", user_ids=[uid])
-            time.sleep(0.5)
+            time.sleep(random.uniform(0.8, 1.5))
         except DirectMessageRequestsDisabled:
             log("  user %s blocks DM requests, replying in thread" % uid)
-            cl.direct_send("", thread_ids=[thread.id], reply_to_message=msg)
+            cl.direct_send(" ", thread_ids=[thread.id], reply_to_message=msg)
             if ext == "mp4":
                 cl.direct_send_video(path, thread_ids=[thread.id])
             else:
@@ -1016,7 +1145,7 @@ def handle_trigger(cl, thread, msg, cache):
         return
 
     # fresh verdict at trigger time — no loop, no stale set
-    if not is_follower(cl, uid, force=True):
+    if not is_follower(cl, uid, max_age=60):
         log("  not a follower")
         send_text(cl, thread, msg, follow_prompt(msg), reply=True)
         return
@@ -1235,6 +1364,12 @@ def poll(cl, process=True, with_requests=False):
                 "last": time.time(),
             }
 
+        if not thread.is_group:
+            with LOCK:
+                for u in (thread.users or []):
+                    if str(u.pk) != str(cl.user_id):
+                        STATE["dm_users"][str(u.pk)] = thread.id
+
         if thread.is_group and process:
             try:
                 handle_new_members(cl, thread)
@@ -1392,7 +1527,7 @@ def main():
     log("watching for", TRIGGER, "and", FLWME_CMD, "every", POLL_INTERVAL, "s")
 
     while not _stop.is_set():
-        _wake.wait(POLL_INTERVAL)
+        _wake.wait(POLL_INTERVAL + random.uniform(0, POLL_INTERVAL * 0.4))
         _wake.clear()
         due = time.time() - last_req >= REQUEST_POLL
         if due:
@@ -1401,18 +1536,24 @@ def main():
             poll(cl, with_requests=due)
         except LoginRequired:
             log("session died, re-logging")
+            time.sleep(random.uniform(20, 40))
             try:
                 cl = build_client()
                 sync_bot_uid(cl)
             except Exception:
                 log(traceback.format_exc())
-                time.sleep(20)
+                time.sleep(45)
         except ChallengeRequired as e:
             log("challenge required:", e)
-            time.sleep(20)
+            time.sleep(60)
         except Exception as e:
-            log("poll error:", e)
-            time.sleep(3)
+            msg_s = str(e).lower()
+            if "429" in msg_s or "too many" in msg_s:
+                log("rate limited, backing off 180s")
+                time.sleep(180)
+            else:
+                log("poll error:", e)
+                time.sleep(random.uniform(3, 7))
 
         if time.time() - last_save > 5:
             save_state()
